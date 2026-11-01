@@ -1,0 +1,404 @@
+% ========================================================================
+% This file is part of BIGEEG project
+% 
+% Free software: you can redistribute it and/or modify
+% it under the terms of the GNU General Public License as published by
+% the Free Software Foundation, either version 3 of the License, or
+% (at your option) any later version.
+% 
+% This code is distributed in the hope that it will be useful,
+% but WITHOUT ANY WARRANTY; without even the implied warranty of
+% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+% GNU General Public License for more details.
+%  
+% Copyright (C) 2026 CNRS - Aix-Marseille Université
+%
+% ========================================================================
+% This software was developed by
+%       Yitong Zuo (Aix-Marseille Université)
+% ------------------------------------------------------------------------
+%
+% DESCRIPTION : 
+% Preprocessing of the EEG data, save bad channel information and IC
+
+clear; clc;
+addpath('C:\Users\yitong_z\Documents\MATLAB\fieldtrip-20250107');
+
+indir  = 'C:\Users\yitong_z\Documents\BIGEEG\data\BIDS';
+outdir = 'C:\Users\yitong_z\Documents\BIGEEG\data\preprocessed';
+if ~exist(outdir,'dir')
+    mkdir(outdir);
+end
+
+subjects = dir(fullfile(indir, 'sub-*'));
+subjects = subjects([subjects.isdir]);
+
+triggerStim = {'64522','64523','64524','64525'};
+triggerResp = {'64532','64533','64534','64535'};
+
+% Load 3D cartesian locations for channels (use one subject's file)
+[~, ftpath] = ft_version;
+elec = ft_read_sens(fullfile(ftpath,'template','electrode','standard_1020.elc'));
+ch_path = 'C:\Users\yitong_z\Documents\BIGEEG\data\BIDS\sub-01\eeg\sub-01_task-looptracing_channels.tsv';
+ch_exam = readtable(ch_path,'FileType','text','Delimiter','\t','TextType','string');
+ch_name  = ch_exam.name(strcmpi(ch_exam.type,'EEG'));
+
+[found,idxElec] = ismember(ch_name,elec.label);
+elecEEG = elec;
+elecEEG.label    = elec.label(idxElec);
+elecEEG.chanpos  = elec.chanpos(idxElec,:);
+elecEEG.elecpos  = elec.elecpos(idxElec,:);
+elecEEG.chantype = elec.chantype(idxElec);
+elecEEG.chanunit = elec.chanunit(idxElec);
+
+labels = cellstr(ch_name);
+Nchan  = numel(labels);
+
+for subindx = 1:length(subjects)
+
+    subID = subjects(subindx).name;
+    fprintf('\nProcessing %s\n',subID);
+
+    eegDir = fullfile(indir,subID,'eeg');
+
+    vhdrFile     = fullfile(eegDir,[subID,'_task-looptracing_eeg.vhdr']);
+    eventsFile   = fullfile(eegDir,[subID,'_task-looptracing_events.tsv']);
+    channelsFile = fullfile(eegDir,[subID,'_task-looptracing_channels.tsv']);
+
+    subOutDir = fullfile(outdir,subID);
+    if ~exist(subOutDir,'dir')
+        mkdir(subOutDir);
+    end
+
+    % Skip if subjects is already processed
+    icaFile = fullfile(subOutDir,[subID '_ICA.mat']);
+    if isfile(icaFile)
+        fprintf('%s already processed. Skipping...\n',subID);
+        continue;
+    end
+
+    % Read in events
+    events = readtable(eventsFile,'FileType','text','Delimiter','\t','TextType','string');
+
+    % Read in EEG header
+    hdr = ft_read_header(vhdrFile);
+    Fs = hdr.Fs;
+
+    % Load continuous EEG
+    cfg = [];
+    cfg.dataset    = vhdrFile;
+    cfg.continuous = "yes";
+    cfg.channel    = labels;
+
+    data = ft_preprocessing(cfg);
+
+    % Temporarily high-filter at 1Hz to render line noise removal and bad 
+    % channel detection more efficient (Bigdely-Shamlo et al., 2015)      
+    data_filt_temp = data;
+    data_filt_temp.trial{1} = ft_preproc_highpassfilter(double(data_filt_temp.trial{1}),...
+                                                        Fs,1,4,'but','twopass');
+
+    %% Remove line noise via spectrum interpolation (Leske & Dalal, 2019)
+    % Attention: neighbour option is too computationally demanding, therefore
+    % neighbor_fft is chosen instead 
+    data_line = data_filt_temp;
+    data_line.trial{1} = ft_preproc_dftfilter(double(data_line.trial{1}),Fs,50,...
+                                                   'dftreplace','neighbour_fft');
+    line_noise = double(data_filt_temp.trial{1})-double(data_line.trial{1});
+
+    data_filt_line = data;
+    data_filt_line.trial{1} = double(data.trial{1})-line_noise;
+
+    %% Bad channel detection (Bigdely-Shamlo et al., 2015) 
+
+    % Concatenate data
+    locStim = events.sample(find(ismember(events.value,cell2mat(cellfun(@str2double,triggerStim,'UniformOutput',false)))));
+    winEpoch = [(locStim-1*Fs),(locStim+6*Fs-1)];
+    nEpoch   = size(winEpoch,1);
+
+    EEG = double(data_line.trial{1});
+    L   = size(EEG,2);
+    EEGLow = ft_preproc_lowpassfilter(EEG,Fs,50,8,'but','twopass');
+    epochLength = 7*Fs;
+
+    EEGCat    = zeros(Nchan,nEpoch*epochLength);
+    EEGLowcat = zeros(Nchan,nEpoch*epochLength);
+
+    for iEpoch = 1:nEpoch
+        % In original sample
+        bdrEpoch = winEpoch(iEpoch,1):winEpoch(iEpoch,2);
+        % In concatenated sample
+        bdrEpochCat = (iEpoch-1)*epochLength+(1:epochLength);
+
+        EEGCat(:,bdrEpochCat)    = EEG(:,bdrEpoch);
+        EEGLowcat(:,bdrEpochCat) = EEGLow(:,bdrEpoch);
+    end
+
+    % Deviation criterion (bad by whole channel deviation)
+    P = diff(prctile(EEGCat,[25 75],2),[],2); % interquartile difference;
+    zP = (P-median(P))./(0.7413*diff(prctile(P,[25 75])));
+    badp = find(zP>5)';
+
+    % Deviation criterion (high SD in few trials)
+    EEGr  = reshape(EEGCat,[Nchan,Fs,nEpoch*7]);
+    SDwin = squeeze(std(EEGr,[],2));
+    new_bad = 1;
+    while (~isempty(new_bad))
+        keep_chan = 1:Nchan; keep_chan(badp) = [];
+        SD = SDwin./prctile(SDwin(keep_chan,:),95,1);
+        SD = prctile(SD,98,2)';
+        new_bad = find(SD>2);
+        new_bad = setdiff(new_bad,badp);
+        badp = sort([badp new_bad]);
+    end
+
+    % Correlation criterion (bad by low correlation with other channels)
+    EEGf = reshape(EEGLowcat,[Nchan,1,Fs,nEpoch*7]);
+    EEGf = bsxfun(@minus,EEGf,mean(EEGf,3)); % remove mean for each channel in each window
+    EEGf = bsxfun(@rdivide,EEGf,std(EEGf,[],3));
+
+    r = zeros(Nchan,Nchan,1,size(EEGf,4)); % allocate space for correlation matrix
+
+    for n_ep = 1:size(EEGf,4)
+        % correlation calculation
+        r(:,:,1,n_ep) = sum(bsxfun(@times,EEGf(:,:,:,n_ep),permute(EEGf(:,:,:,n_ep),[2 1 3 4]))/(Fs-1),3);
+    end
+
+    rmax = prctile(abs(r),95-100/Nchan,2); % high correlation percentile
+    badr = find(prctile(rmax,5,4)<0.25)';
+
+    % Noisiness criterion (bad by too high ratio between high and low
+    % frequency amplitudes)
+    Pr = median(abs(EEGCat-EEGLowcat),2)./median(abs(EEGLowcat),2);
+    zPr = (Pr-median(Pr))./(0.7413*diff(prctile(Pr,[25 75])));
+    badpr = find(zPr>5)';
+
+    % Predictability criterion (bad by lack of predictability from other
+    % channels)
+    nRansac    = 50;
+    sampleProp = 0.25;
+    corrThresh = 0.75;
+    fracThresh = 0.40;
+    
+    rng(435656,'twister'); % Reproducible random subsets
+     
+    badPrior = unique([badp(:); badr(:); badpr(:)]); % exclude previously identified bad channels
+    goodChan = setdiff(1:Nchan,badPrior);
+    
+    nPick = round(sampleProp*numel(goodChan));
+
+    testData = [];
+    testData.label    = labels;
+    testData.fsample  = Fs;
+    testData.trial{1} = eye(Nchan);
+    testData.time{1}  = (0:Nchan-1)/Fs;
+    testData.elec     = elecEEG;
+
+    W = zeros(Nchan,Nchan,nRansac);
+    wasSelected = false(Nchan,nRansac);
+
+    for k = 1:nRansac
+        selected = goodChan(randperm(numel(goodChan),nPick)); % randomly select predictors
+        wasSelected(selected,k) = true;
+        missing = setdiff(1:Nchan,selected); % treat the rest as to be reconstructed 
+    
+        cfg = [];
+        cfg.method     = 'spline';
+        cfg.badchannel = labels(missing);
+        cfg.elec       = elecEEG;
+        cfg.senstype   = 'eeg';
+    
+        interpTest = ft_channelrepair(cfg,testData); % computes the interpolation matrix
+    
+        [found,order] = ismember(labels,interpTest.label); % restore channel order   
+        W(:,:,k) = double(interpTest.trial{1}(order,:)); % store interpolation weights  
+    end
+
+    nSamplesWin = round(5*Fs);
+    ransacCorr  = nan(Nchan,nEpoch);
+
+    for iEpoch = 1:nEpoch
+        idx_pred = (iEpoch-1)*7*Fs + Fs + (1:nSamplesWin);
+        epochPred = double(EEGLowcat(:,idx_pred));
+        epochPredClean = epochPred;
+        epochPredClean(badPrior,:) = 0;
+        X = epochPredClean-mean(epochPredClean,2);
+
+        epochGen = zeros(Nchan,nSamplesWin,nRansac); 
+
+        for k = 1:nRansac
+            epochGen(:,:,k) = W(:,:,k)*epochPredClean;
+            % do not use a channel's own observed signal as one of its
+            % predictors 
+            epochGen(wasSelected(:,k),:,k) = NaN; 
+        end
+
+        epochMedian = median(epochGen,3,'omitnan'); % median prediction
+        Y = epochMedian-mean(epochMedian,2);
+        numerator = sum(X.*Y,2);
+        denominator = sqrt(sum(X.^2,2).*sum(Y.^2,2));
+        r_sml = numerator./denominator;
+
+        ransacCorr(goodChan,iEpoch) = r_sml(goodChan);
+    end
+
+    badFraction = nan(Nchan,1);
+    badFraction(goodChan) = mean(abs(ransacCorr(goodChan,:))<corrThresh,2);
+    badransac = find(badFraction>fracThresh)';
+
+    % Combine all the bad channels
+    % bad_ch = unique([badPrior(:); badransac(:)]);
+
+    % Save bad channel information
+    badChannelNames = ch_name(bad_ch);
+    badChannelsTable = table( ...
+        bad_ch(:),badChannelNames(:), ...
+        ismember(bad_ch(:),badp(:)), ...
+        ismember(bad_ch(:),badr(:)), ...
+        ismember(bad_ch(:),badpr(:)), ...
+        ismember(bad_ch(:),badransac(:)), ...
+        'VariableNames',{'index','name','bad_deviation', ...
+                         'bad_correlation','bad_highfreq','bad_ransac'});
+    badChannelFile = fullfile(subOutDir,[subID '_badchannels.tsv']);    
+    writetable(badChannelsTable,badChannelFile,'FileType','text','Delimiter','\t');
+
+    %% Interpolation 
+    data_interp = data_filt_line;
+    if ~isempty(bad_ch)
+        cfg = [];
+        cfg.method     = 'spline';
+        cfg.badchannel = data_interp.label(bad_ch);
+        cfg.elec       = elecEEG;
+        cfg.senstype   = 'eeg';
+    
+        data_interp = ft_channelrepair(cfg,data_interp);
+    end
+
+    %% Re-reference to average
+    cfg = [];
+    cfg.reref      = 'yes';
+    cfg.refchannel = 'all';
+    
+    data_reref = ft_preprocessing(cfg, data_interp);
+
+    %% Filter the data 
+    cfg = [];
+
+    cfg.hpfilter   = 'yes';
+    cfg.hpfreq     = 0.1;
+    cfg.hpfilttype = 'but';
+    cfg.hpfiltord  = 4;
+    cfg.hpfiltdir  = 'twopass';
+    
+    cfg.lpfilter   = 'yes';
+    cfg.lpfreq     = 120;
+    cfg.lpfilttype = 'but';
+    cfg.lpfiltord  = 8;
+    cfg.lpfiltdir  = 'twopass';
+    
+    data_analysis = ft_preprocessing(cfg,data_reref);
+
+    %% ICA computation 
+
+    % Create an ICA-fitting dataset (1Hz high-pass)
+    cfg = [];
+
+    cfg.hpfilter   = 'yes';
+    cfg.hpfreq     = 1;
+    cfg.hpfilttype = 'but';
+    cfg.hpfiltord  = 4;
+    cfg.hpfiltdir  = 'twopass';
+
+    data_ica = ft_preprocessing(cfg,data_reref);
+
+    EEG_ica = double(data_ica.trial{1});
+    [Nchan_interp,L_interp] = size(EEG_ica);
+
+    % Detect extreme-amplitude time periods
+    ampWin = round(Fs); % moving-average duration of 1s
+    thresholdSD = 10;
+    badInitial = false(1,L_interp);
+    ampThreshold = zeros(Nchan_interp,1);
+    
+    for nChan = 1:Nchan_interp
+        amp = abs(EEG_ica(nChan,:)); % aboslute EEG amplitude
+        amp = movmean(amp,ampWin,'Endpoints','shrink'); % smoothed absolute amplitude
+    
+        % Channel-specific amplitude threshold
+        ampThreshold(nChan) = mean(amp)+thresholdSD*std(amp);
+    
+        % Flag samples exceeding the threshold
+        badInitial = badInitial|(amp>ampThreshold(nChan));
+    end
+
+    % Extend by approximately 1 second on either side of artifact periods
+    paddingSamples = round(Fs);
+    badMask = movmax(double(badInitial),[paddingSamples paddingSamples])>0;
+
+    % Retain only selected periods without gross artifacts
+    taskMask = true(1,L_interp);
+    keepMask = taskMask & ~badMask;
+    keepICA  = find(keepMask);   
+    nKeep = numel(keepICA);
+
+    % Estimate the effective EEG rank 
+    % Use up to 50,000 evenly distributed retained samples
+    nRankSamples = min(50000,nKeep);  
+    idxRank = round(linspace(1,nKeep,nRankSamples)); 
+    Xrank = EEG_ica(:,keepICA(idxRank));
+    Xrank = Xrank-mean(Xrank,2);  
+    rankNumeric = rank(Xrank);
+    clear Xrank
+    
+    % Conservative upper bound based on previous
+    % bad-channel interpolation and average referencing
+    nInterpolated = numel(unique(bad_ch));    
+    maxRank = Nchan-nInterpolated-1;
+
+    % Select ICA dimensionality
+    nIC = min(rankNumeric,maxRank);
+   
+    dataICAfit = [];
+    
+    dataICAfit.label = data_ica.label;
+    dataICAfit.fsample = Fs;
+    dataICAfit.trial{1} = EEG_ica(:,keepICA);
+    dataICAfit.time{1} = (0:nKeep-1)/Fs; % synthetic time vector for concatenated samples
+    dataICAfit.elec = data_ica.elec;
+
+    cfg = [];    
+    cfg.method = 'fastica';
+    cfg.numcomponent = nIC;    
+    cfg.fastica.lastEig = nIC; % restrict PCA whitening to nIC
+    cfg.fastica.g = 'pow3'; % FastICA nonlinearity
+    cfg.demean = 'yes';
+    cfg.randomseed = 435656;
+    
+    compICA = ft_componentanalysis(cfg,dataICAfit);
+
+    % Save ICA results for manual inspection and preprocessed data
+    compICAFile = fullfile(subOutDir,[subID '_ICA.mat']);
+    dataICAFile = fullfile(subOutDir,[subID '_ICAdata.mat']);    
+    dataAnalysisFile = fullfile(subOutDir,[subID '_analysisdata.mat']);
+    save(compICAFile,'compICA','nIC','rankNumeric','bad_ch','badChannelNames','badMask','elecEEG','-v7.3');   
+    save(dataICAFile,'data_ica','-v7.3');
+    save(dataAnalysisFile,'data_analysis','-v7.3');
+end 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
